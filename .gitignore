@@ -1,0 +1,4 @@
+build
+build-static
+build-shared
+test_uploads
