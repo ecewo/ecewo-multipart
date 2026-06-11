@@ -32,7 +32,7 @@ Multipart/form-data parser plugin for [ecewo](https://github.com/savashn/ecewo).
 Add to your `CMakeLists.txt`:
 
 ```cmake
-ecewo_add(multipart)
+ecewo_add(multipart@v0.1.0)
 
 target_link_libraries(app PRIVATE
   ecewo::ecewo
