@@ -28,12 +28,16 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <stdlib.h>
+#include <errno.h>
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
+#include <windows.h>
+#include <wincrypt.h>
 #define getpid _getpid
 #else
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -105,7 +109,6 @@ static const multipart_config_t *cfg_for_request(const ecewo_request_t *req) {
 }
 
 // Process-wide name-uniquifier for generated filenames
-static _Atomic uint64_t g_file_counter = 0;
 
 #define MULTIPART_CTX_KEY "ecewo_multipart"
 #define STREAM_MP_KEY "ecewo_multipart_stream"
@@ -217,6 +220,8 @@ static char *extract_boundary(ecewo_arena_t *arena, const char *content_type) {
           if (len == 0 || len > 256)
             return NULL;
           char *boundary = ecewo_alloc(arena, len + 1);
+          if (!boundary)
+            return NULL;
           memcpy(boundary, p, len);
           boundary[len] = '\0';
           return boundary;
@@ -229,6 +234,8 @@ static char *extract_boundary(ecewo_arena_t *arena, const char *content_type) {
         if (len == 0 || len > 256)
           return NULL;
         char *boundary = ecewo_alloc(arena, len + 1);
+        if (!boundary)
+          return NULL;
         memcpy(boundary, start, len);
         boundary[len] = '\0';
         return boundary;
@@ -265,6 +272,8 @@ static char *extract_param(ecewo_arena_t *arena, const char *header, const char 
           return NULL;
         size_t len = (size_t)(end - candidate);
         char *value = ecewo_alloc(arena, len + 1);
+        if (!value)
+          return NULL;
         memcpy(value, candidate, len);
         value[len] = '\0';
         return value;
@@ -277,6 +286,8 @@ static char *extract_param(ecewo_arena_t *arena, const char *header, const char 
       if (len == 0)
         return NULL;
       char *value = ecewo_alloc(arena, len + 1);
+      if (!value)
+        return NULL;
       memcpy(value, start, len);
       value[len] = '\0';
       return value;
@@ -315,6 +326,8 @@ static char *find_part_header(ecewo_arena_t *arena, const char *headers, size_t 
           val++;
         size_t val_len = (size_t)(line_end - val);
         char *result = ecewo_alloc(arena, val_len + 1);
+        if (!result)
+          return NULL;
         memcpy(result, val, val_len);
         result[val_len] = '\0';
         return result;
@@ -328,6 +341,54 @@ static char *find_part_header(ecewo_arena_t *arena, const char *headers, size_t 
   }
 
   return NULL;
+}
+
+// Fills `out` with `hex_len` lowercase hex characters plus a NUL, from the
+// platform CSPRNG. Upload file names must not be guessable: a predictable name
+// in a shared directory lets a local attacker pre-create it (as a symlink or
+// otherwise) before the server does.
+static bool random_hex(char *out, size_t hex_len) {
+  static const char digits[] = "0123456789abcdef";
+  unsigned char bytes[32];
+  size_t need = (hex_len + 1) / 2;
+
+  if (need > sizeof(bytes))
+    return false;
+
+#ifdef _WIN32
+  HCRYPTPROV prov;
+  if (!CryptAcquireContext(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+    return false;
+  BOOL ok = CryptGenRandom(prov, (DWORD)need, bytes);
+  CryptReleaseContext(prov, 0);
+  if (!ok)
+    return false;
+#else
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd < 0)
+    return false;
+  size_t got = 0;
+  while (got < need) {
+    ssize_t r = read(fd, bytes + got, need - got);
+    if (r < 0) {
+      if (errno == EINTR)
+        continue;
+      close(fd);
+      return false;
+    }
+    if (r == 0) {
+      close(fd);
+      return false;
+    }
+    got += (size_t)r;
+  }
+  close(fd);
+#endif
+
+  for (size_t i = 0; i < hex_len; i++)
+    out[i] = digits[(bytes[i / 2] >> (i % 2 ? 0 : 4)) & 0x0F];
+  out[hex_len] = '\0';
+  return true;
 }
 
 static const char *get_tmp_dir(void) {
@@ -344,13 +405,15 @@ static const char *get_tmp_dir(void) {
 #endif
 }
 
+static char *generate_tmp_path_in(ecewo_arena_t *arena, const char *dir) {
+  char rnd[33];
+  if (!random_hex(rnd, 32))
+    return NULL;
+  return ecewo_sprintf(arena, "%s/ecewo-mp-%s.tmp", dir, rnd);
+}
+
 static char *generate_tmp_path(ecewo_arena_t *arena) {
-  uint64_t count = atomic_fetch_add(&g_file_counter, 1);
-  time_t now = time(NULL);
-  return ecewo_sprintf(arena, "%s/ecewo-mp-%lu-%lu-%d.tmp",
-                       get_tmp_dir(),
-                       (unsigned long)now, (unsigned long)count,
-                       (int)getpid());
+  return generate_tmp_path_in(arena, get_tmp_dir());
 }
 
 // Validate a file extension; returns ".ext" or "".
@@ -375,6 +438,8 @@ static const char *safe_extension(ecewo_arena_t *arena, const char *filename) {
   }
 
   char *safe = ecewo_alloc(arena, len + 2);
+  if (!safe)
+    return "";
   safe[0] = '.';
   memcpy(safe + 1, ext, len);
   safe[len + 1] = '\0';
@@ -391,17 +456,23 @@ static ecewo_multipart_t *parse_multipart_body(ecewo_arena_t *arena,
                                                size_t body_len,
                                                const char *boundary) {
   ecewo_multipart_t *data = ecewo_alloc(arena, sizeof(ecewo_multipart_t));
+  if (!data)
+    return NULL;
   memset(data, 0, sizeof(*data));
 
   size_t fields_cap = 4;
   size_t files_cap = 4;
   data->fields = ecewo_alloc(arena, fields_cap * sizeof(ecewo_multipart_field_t));
   data->files = ecewo_alloc(arena, files_cap * sizeof(ecewo_multipart_file_t));
+  if (!data->fields || !data->files)
+    return NULL;
 
   size_t bnd_len = strlen(boundary);
 
   size_t first_delim_len = 2 + bnd_len;
   char *first_delim = ecewo_alloc(arena, first_delim_len + 1);
+  if (!first_delim)
+    return NULL;
   first_delim[0] = '-';
   first_delim[1] = '-';
   memcpy(first_delim + 2, boundary, bnd_len);
@@ -409,6 +480,8 @@ static ecewo_multipart_t *parse_multipart_body(ecewo_arena_t *arena,
 
   size_t delim_len = 4 + bnd_len;
   char *delim = ecewo_alloc(arena, delim_len + 1);
+  if (!delim)
+    return NULL;
   delim[0] = '\r';
   delim[1] = '\n';
   delim[2] = '-';
@@ -578,6 +651,10 @@ static void multipart_finish(ecewo_request_t *req, ecewo_response_t *res, ecewo_
   }
 
   ecewo_multipart_t *data = parse_multipart_body(arena, cfg->max_parts, body, body_len, boundary);
+  if (!data) {
+    ecewo_send_text(res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+    return;
+  }
 
   ecewo_context_set(req, MULTIPART_CTX_KEY, data);
 
@@ -585,6 +662,10 @@ static void multipart_finish(ecewo_request_t *req, ecewo_response_t *res, ecewo_
 
   if (local_disk_dest && data->file_count > 0) {
     DiskSaveCtx *ctx = ecewo_alloc(arena, sizeof(DiskSaveCtx));
+    if (!ctx) {
+      ecewo_send_text(res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+      return;
+    }
     ctx->req = req;
     ctx->res = res;
     ctx->next = next;
@@ -594,12 +675,18 @@ static void multipart_finish(ecewo_request_t *req, ecewo_response_t *res, ecewo_
     for (size_t i = 0; i < data->file_count; i++) {
       ecewo_multipart_file_t *file = &data->files[i];
 
-      uint64_t count = atomic_fetch_add(&g_file_counter, 1);
-      time_t now = time(NULL);
-
       const char *ext = safe_extension(arena, file->filename);
-      char *dest_path = ecewo_sprintf(arena, "%s/%lu-%lu%s", local_disk_dest,
-                                      (unsigned long)now, (unsigned long)count, ext);
+      char rnd[33];
+      char *dest_path = NULL;
+      if (random_hex(rnd, 32))
+        dest_path = ecewo_sprintf(arena, "%s/%s%s", local_disk_dest, rnd, ext);
+
+      if (!dest_path) {
+        bool expected = false;
+        if (atomic_compare_exchange_strong(&ctx->errored, &expected, true))
+          ecewo_send_text(res, ECEWO_INTERNAL_SERVER_ERROR, "Failed to save uploaded file");
+        return;
+      }
 
       if (file->path != NULL && file->data == NULL) {
         // Already on disk (spilled) — rename it
@@ -616,8 +703,8 @@ static void multipart_finish(ecewo_request_t *req, ecewo_response_t *res, ecewo_
       } else {
         file->path = dest_path;
 
-        int result = fs_write_file(dest_path, file->data, file->size,
-                                   on_file_saved, ctx);
+        int result = fs_write_file_private(dest_path, file->data, file->size,
+                                           on_file_saved, ctx);
         if (result != 0) {
           bool expected = false;
           if (atomic_compare_exchange_strong(&ctx->errored, &expected, true))
@@ -786,12 +873,22 @@ static void smp_flush_write_queue(StreamMpCtx *ctx, SmpFile *file) {
   file->write_in_flight = true;
 
   SmpWriteCb *cb = ecewo_alloc(ecewo_req_arena(ctx->req), sizeof(SmpWriteCb));
+  if (!cb) {
+    file->write_in_flight = false;
+    free(chunk->data);
+    free(chunk);
+    if (!ctx->cancelled) {
+      ctx->cancelled = true;
+      ecewo_send_text(ctx->res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+    }
+    return;
+  }
   cb->ctx = ctx;
   cb->file = file;
   cb->chunk = chunk;
 
-  if (fs_append_file(file->tmp_path, chunk->data, chunk->len,
-                     smp_on_chunk_written, cb)
+  if (fs_append_file_private(file->tmp_path, chunk->data, chunk->len,
+                             smp_on_chunk_written, cb)
       != 0) {
     file->write_in_flight = false;
     free(chunk->data);
@@ -861,14 +958,25 @@ static void smp_finalize_file(StreamMpCtx *ctx, SmpFile *file) {
   }
 
   if (file->dest_dir) {
-    uint64_t count = atomic_fetch_add(&g_file_counter, 1);
-    time_t now = time(NULL);
     const char *ext = safe_extension(arena, file->filename);
-    char *dest_path = ecewo_sprintf(arena, "%s/%lu-%lu%s", file->dest_dir,
-                                    (unsigned long)now, (unsigned long)count, ext);
-    mf->path = dest_path;
+    char rnd[33];
+    char *dest_path = NULL;
+    if (random_hex(rnd, 32))
+      dest_path = ecewo_sprintf(arena, "%s/%s%s", file->dest_dir, rnd, ext);
 
-    SmpWriteCb *cb = ecewo_alloc(arena, sizeof(SmpWriteCb));
+    SmpWriteCb *cb = dest_path ? ecewo_alloc(arena, sizeof(SmpWriteCb)) : NULL;
+
+    if (!dest_path || !cb) {
+      if (!ctx->cancelled) {
+        ctx->cancelled = true;
+        ecewo_send_text(ctx->res, ECEWO_INTERNAL_SERVER_ERROR, "Failed to save uploaded file");
+      }
+      atomic_fetch_sub(&ctx->pending_writes, 1);
+      smp_try_finish(ctx);
+      return;
+    }
+
+    mf->path = dest_path;
     cb->ctx = ctx;
     cb->file = file;
     cb->chunk = NULL;
@@ -897,6 +1005,10 @@ static void smp_try_finish(StreamMpCtx *ctx) {
     return;
 
   ecewo_multipart_t *data = ecewo_alloc(ecewo_req_arena(ctx->req), sizeof(ecewo_multipart_t));
+  if (!data) {
+    ecewo_send_text(ctx->res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+    return;
+  }
   data->fields = ctx->fields;
   data->field_count = ctx->field_count;
   data->files = ctx->files;
@@ -906,13 +1018,34 @@ static void smp_try_finish(StreamMpCtx *ctx) {
   ctx->next(ctx->req, ctx->res);
 }
 
+// A part's header block is bounded; anything past the cap is a malformed or
+// hostile request rather than something to keep growing a buffer for.
+#ifndef MULTIPART_MAX_PART_HEADERS
+#define MULTIPART_MAX_PART_HEADERS ((size_t)16 * 1024)
+#endif
+
 static void smp_header_append(StreamMpCtx *ctx, const char *data, size_t len) {
   ecewo_arena_t *arena = ecewo_req_arena(ctx->req);
+
+  if (ctx->header_len + len + 1 > MULTIPART_MAX_PART_HEADERS) {
+    ctx->state = SMP_ERROR;
+    return;
+  }
+
   if (ctx->header_len + len + 1 > ctx->header_cap) {
     size_t new_cap = ctx->header_cap ? ctx->header_cap * 2 : 512;
     while (new_cap < ctx->header_len + len + 1)
       new_cap *= 2;
-    ctx->header_buf = ecewo_realloc(arena, ctx->header_buf, ctx->header_cap, new_cap);
+    if (new_cap > MULTIPART_MAX_PART_HEADERS)
+      new_cap = MULTIPART_MAX_PART_HEADERS;
+    char *grown = ecewo_realloc(arena, ctx->header_buf, ctx->header_cap, new_cap);
+    // Capacity is only advertised once the memory really exists: the writes
+    // below trust it.
+    if (!grown) {
+      ctx->state = SMP_ERROR;
+      return;
+    }
+    ctx->header_buf = grown;
     ctx->header_cap = new_cap;
   }
   memcpy(ctx->header_buf + ctx->header_len, data, len);
@@ -920,6 +1053,14 @@ static void smp_header_append(StreamMpCtx *ctx, const char *data, size_t len) {
 }
 
 static void smp_parse_headers(StreamMpCtx *ctx, const char *disk_dest) {
+  if (!ctx->header_buf) {
+    ctx->cur_fieldname = NULL;
+    ctx->cur_filename = NULL;
+    ctx->cur_is_file = false;
+    ctx->cur_file = NULL;
+    ctx->header_len = 0;
+    return;
+  }
   ctx->header_buf[ctx->header_len] = '\0';
   ecewo_arena_t *arena = ecewo_req_arena(ctx->req);
 
@@ -945,6 +1086,12 @@ static void smp_parse_headers(StreamMpCtx *ctx, const char *disk_dest) {
     ctx->cur_mimetype = ct ? ct : ecewo_strdup(arena, "application/octet-stream");
 
     SmpFile *f = ecewo_alloc(arena, sizeof(SmpFile));
+    if (!f) {
+      ctx->cur_file = NULL;
+      ctx->state = SMP_ERROR;
+      ctx->header_len = 0;
+      return;
+    }
     memset(f, 0, sizeof(SmpFile));
     f->fieldname = ctx->cur_fieldname ? ctx->cur_fieldname : ecewo_strdup(arena, "");
     f->filename = ctx->cur_filename;
@@ -953,13 +1100,16 @@ static void smp_parse_headers(StreamMpCtx *ctx, const char *disk_dest) {
     // Stage in the destination directory to keep the final rename intra-FS (no EXDEV).
     f->dest_dir = disk_dest ? ecewo_strdup(arena, disk_dest) : NULL;
 
-    if (f->dest_dir) {
-      uint64_t cnt = atomic_fetch_add(&g_file_counter, 1);
-      f->tmp_path = ecewo_sprintf(arena, "%s/ecewo-mp-%lu-%lu-%d.tmp", f->dest_dir,
-                                  (unsigned long)time(NULL), (unsigned long)cnt,
-                                  (int)getpid());
-    } else {
+    if (f->dest_dir)
+      f->tmp_path = generate_tmp_path_in(arena, f->dest_dir);
+    else
       f->tmp_path = generate_tmp_path(arena);
+
+    if (!f->tmp_path) {
+      ctx->cur_file = NULL;
+      ctx->state = SMP_ERROR;
+      ctx->header_len = 0;
+      return;
     }
 
     ctx->cur_file = f;
@@ -985,8 +1135,13 @@ static void smp_flush_body(StreamMpCtx *ctx, const char *data, size_t len) {
       size_t new_cap = ctx->field_buf_cap ? ctx->field_buf_cap * 2 : 256;
       while (new_cap < ctx->field_len + len + 1)
         new_cap *= 2;
-      ctx->field_buf = ecewo_realloc(arena, ctx->field_buf,
-                                     ctx->field_buf_cap, new_cap);
+      char *grown = ecewo_realloc(arena, ctx->field_buf,
+                                  ctx->field_buf_cap, new_cap);
+      if (!grown) {
+        ctx->state = SMP_ERROR;
+        return;
+      }
+      ctx->field_buf = grown;
       ctx->field_buf_cap = new_cap;
     }
     memcpy(ctx->field_buf + ctx->field_len, data, len);
@@ -1241,16 +1396,27 @@ void ecewo_multipart(ecewo_request_t *req, ecewo_response_t *res, ecewo_next_t n
     size_t bnd_len = strlen(boundary);
 
     StreamMpCtx *ctx = ecewo_alloc(arena, sizeof(StreamMpCtx));
+    if (!ctx) {
+      ecewo_send_text(res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+      return;
+    }
     memset(ctx, 0, sizeof(StreamMpCtx));
 
     ctx->first_delim = ecewo_alloc(arena, bnd_len + 3);
+    ctx->body_delim = ecewo_alloc(arena, bnd_len + 5);
+    ctx->tail_cap = bnd_len + 6;
+    ctx->tail = ecewo_alloc(arena, ctx->tail_cap);
+    if (!ctx->first_delim || !ctx->body_delim || !ctx->tail) {
+      ecewo_send_text(res, ECEWO_INTERNAL_SERVER_ERROR, "Out of memory");
+      return;
+    }
+
     ctx->first_delim[0] = '-';
     ctx->first_delim[1] = '-';
     memcpy(ctx->first_delim + 2, boundary, bnd_len);
     ctx->first_delim[bnd_len + 2] = '\0';
     ctx->first_delim_len = bnd_len + 2;
 
-    ctx->body_delim = ecewo_alloc(arena, bnd_len + 5);
     ctx->body_delim[0] = '\r';
     ctx->body_delim[1] = '\n';
     ctx->body_delim[2] = '-';
@@ -1259,8 +1425,6 @@ void ecewo_multipart(ecewo_request_t *req, ecewo_response_t *res, ecewo_next_t n
     ctx->body_delim[bnd_len + 4] = '\0';
     ctx->body_delim_len = bnd_len + 4;
 
-    ctx->tail_cap = ctx->body_delim_len + 2;
-    ctx->tail = ecewo_alloc(arena, ctx->tail_cap);
     ctx->state = SMP_PREAMBLE;
     atomic_store(&ctx->pending_writes, 0);
     ctx->req = req;
